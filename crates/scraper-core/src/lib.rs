@@ -280,6 +280,174 @@ impl<F: Fetcher> ExtractionEngine<F> {
 mod tests {
     use super::*;
     use shared::ExtractionRule;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    // ── Offline test helpers ────────────────────────────────────────────────
+
+    /// A fetcher that returns fixed HTML, for deterministic offline pipeline tests.
+    struct StaticFetcher {
+        html: String,
+    }
+
+    impl Fetcher for StaticFetcher {
+        async fn fetch_html(&self, _job: &ScrapeJob) -> Result<String, FetchError> {
+            Ok(self.html.clone())
+        }
+    }
+
+    /// A fetcher that fails `fail_times` then returns empty HTML, to exercise retries.
+    struct FlakyFetcher {
+        fail_times: u32,
+        calls: Arc<AtomicU32>,
+    }
+
+    impl Fetcher for FlakyFetcher {
+        async fn fetch_html(&self, _job: &ScrapeJob) -> Result<String, FetchError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                Err(FetchError::Network(format!("synthetic failure #{n}")))
+            } else {
+                // Empty doc: no extraction rules → success with empty data.
+                Ok("<html></html>".to_string())
+            }
+        }
+    }
+
+    fn job_with(html_url: &str, rules: Vec<ExtractionRule>, retries: u32) -> ScrapeJob {
+        ScrapeJob {
+            job_name: "t".into(),
+            url: html_url.into(),
+            schedule: None,
+            fetcher: shared::FetcherType::Http,
+            headers: Default::default(),
+            extraction: rules,
+            output: None,
+            retries,
+        }
+    }
+
+    fn rule(selector: &str, name: &str, attr: Option<&str>) -> ExtractionRule {
+        ExtractionRule {
+            selector: selector.into(),
+            name: name.into(),
+            attribute: attr.map(|s| s.into()),
+        }
+    }
+
+    // ── extract() behavior ──────────────────────────────────────────────────
+
+    #[test]
+    fn extract_single_match_is_scalar() {
+        let f = StaticFetcher { html: String::new() };
+        let html = r#"<div class="x">only</div>"#;
+        let data = f.extract("j", "u", html, &[rule(".x", "x", None)]).unwrap();
+        assert_eq!(data["x"], serde_json::json!("only"));
+    }
+
+    #[test]
+    fn extract_multiple_matches_is_array() {
+        let f = StaticFetcher { html: String::new() };
+        let html = r#"<a class="x">1</a><a class="x">2</a>"#;
+        let data = f.extract("j", "u", html, &[rule(".x", "x", None)]).unwrap();
+        assert_eq!(data["x"], serde_json::json!(["1", "2"]));
+    }
+
+    #[test]
+    fn extract_attribute_present_and_missing() {
+        let f = StaticFetcher { html: String::new() };
+        // First link has href, second does not. A missing attribute yields JSON
+        // `null` (from `unwrap_or_default()` on the Option<Value>), not "".
+        let html = r#"<a class="l" href="/p1">a</a><a class="l">b</a>"#;
+        let data = f
+            .extract("j", "u", html, &[rule(".l", "link", Some("href"))])
+            .unwrap();
+        assert_eq!(data["link"], serde_json::json!(["/p1", null]));
+    }
+
+    #[test]
+    fn extract_no_match_rule_is_skipped() {
+        let f = StaticFetcher { html: String::new() };
+        let html = r#"<p>hi</p>"#;
+        let data = f
+            .extract("j", "u", html, &[rule(".missing", "gone", None)])
+            .unwrap();
+        assert!(data.get("gone").is_none());
+        assert_eq!(data, serde_json::json!({}));
+    }
+
+    #[test]
+    fn extract_multiple_rules_merge_into_one_object() {
+        let f = StaticFetcher { html: String::new() };
+        let html = r#"<h1 class="t">Title</h1><span class="a" data-id="9">x</span>"#;
+        let data = f
+            .extract(
+                "j",
+                "u",
+                html,
+                &[
+                    rule(".t", "title", None),
+                    rule(".a", "id", Some("data-id")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(data["title"], serde_json::json!("Title"));
+        assert_eq!(data["id"], serde_json::json!("9"));
+    }
+
+    #[test]
+    fn extract_invalid_selector_errors() {
+        let f = StaticFetcher { html: String::new() };
+        let err = f
+            .extract("j", "u", "<p>x</p>", &[rule("p => span", "bad", None)])
+            .unwrap_err();
+        assert!(matches!(err, ParseError::InvalidSelector(_, _)));
+    }
+
+    // ── Full pipeline + retries (offline, time paused) ──────────────────────
+
+    #[tokio::test]
+    async fn scrape_pipeline_success_offline() {
+        let f = StaticFetcher {
+            html: r#"<a class="x">hello</a>"#.into(),
+        };
+        let engine = ExtractionEngine::new(f);
+        let job = job_with("https://example.com", vec![rule(".x", "x", None)], 0);
+        let result = engine.run(&job).await;
+        assert_eq!(result.status, shared::JobStatus::Done);
+        assert_eq!(result.data["x"], serde_json::json!("hello"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_succeed_after_transient_failures() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let f = FlakyFetcher {
+            fail_times: 2,
+            calls: calls.clone(),
+        };
+        let engine = ExtractionEngine::new(f);
+        // retries=3 → up to 4 attempts; fails twice then succeeds on the 3rd.
+        let job = job_with("https://example.com", Vec::new(), 3);
+        let result = engine.run_with_retries(&job).await;
+        assert_eq!(result.status, shared::JobStatus::Done);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_exhausted_returns_error() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let f = FlakyFetcher {
+            fail_times: 100, // always fails within the budget
+            calls: calls.clone(),
+        };
+        let engine = ExtractionEngine::new(f);
+        let job = job_with("https://example.com", Vec::new(), 2);
+        let result = engine.run_with_retries(&job).await;
+        assert_eq!(result.status, shared::JobStatus::Error);
+        assert!(result.error.is_some());
+        // retries=2 → exactly 3 attempts.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
 
     #[tokio::test]
     async fn test_http_client_fetch() {

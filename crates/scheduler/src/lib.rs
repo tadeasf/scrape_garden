@@ -3,7 +3,8 @@
 use chrono::{Datelike, Timelike, Utc};
 use scraper_core::{ExtractionEngine, HttpClient};
 use shared::{
-    Config, DashboardMessage, JobStatus, LogEntry, ScrapeJob, ScrapeResult, SharedError,
+    Config, DashboardMessage, FetcherType, JobStatus, LogEntry, ScrapeJob, ScrapeResult,
+    SharedError,
 };
 use std::io::Write;
 use thiserror::Error;
@@ -57,6 +58,12 @@ impl ResultWriter {
     /// Append a single result to a JSONL file. Creates the file if it doesn't exist.
     pub fn write(result: &ScrapeResult, output_path: &str) -> Result<(), SchedulerError> {
         let line = serde_json::to_string(result)?;
+        // Create parent directories if the path is nested (e.g. "data/x.jsonl").
+        if let Some(parent) = std::path::Path::new(output_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -71,12 +78,15 @@ impl ResultWriter {
         job: &ScrapeJob,
         global_output_dir: Option<&str>,
     ) -> Result<(), SchedulerError> {
-        let output_path = job
-            .output
-            .as_deref()
-            .or(global_output_dir)
-            .unwrap_or("results.jsonl");
-        Self::write(result, output_path)
+        // Explicit per-job `output` is an exact file path. Otherwise, treat the
+        // global `output_dir` as a directory and write `{dir}/{job_name}.jsonl`.
+        // Final fallback: a `results.jsonl` file in the current directory.
+        let output_path = match (job.output.as_deref(), global_output_dir) {
+            (Some(path), _) => path.to_string(),
+            (None, Some(dir)) => format!("{dir}/{}.jsonl", job.job_name),
+            (None, None) => "results.jsonl".to_string(),
+        };
+        Self::write(result, &output_path)
     }
 }
 
@@ -86,11 +96,24 @@ impl ResultWriter {
 #[derive(Clone)]
 pub struct JobRunner {
     log_tx: tokio::sync::mpsc::UnboundedSender<DashboardMessage>,
+    /// Optional global user-agent applied to HTTP fetches.
+    user_agent: Option<String>,
 }
 
 impl JobRunner {
     pub fn new(log_tx: tokio::sync::mpsc::UnboundedSender<DashboardMessage>) -> Self {
-        Self { log_tx }
+        Self {
+            log_tx,
+            user_agent: None,
+        }
+    }
+
+    /// Create a runner that applies a custom user-agent to HTTP fetches.
+    pub fn with_user_agent(
+        log_tx: tokio::sync::mpsc::UnboundedSender<DashboardMessage>,
+        user_agent: Option<String>,
+    ) -> Self {
+        Self { log_tx, user_agent }
     }
 
     /// Run a single job with retries and write the result.
@@ -108,12 +131,24 @@ impl JobRunner {
             message: format!("Starting job: {}", job.job_name),
         }));
 
-        // Build the extraction engine with an HTTP client.
-        let fetcher = HttpClient::new();
-        let engine = ExtractionEngine::new(fetcher);
-
-        // Run with retries.
-        let result = engine.run_with_retries(job).await;
+        // The browser fetcher is declared in the config schema but not yet
+        // implemented; fail explicitly rather than silently fetching over HTTP.
+        let result = if job.fetcher == FetcherType::Browser {
+            ScrapeResult::failure(
+                &job.job_name,
+                &job.url,
+                "browser fetcher not implemented",
+            )
+        } else {
+            // Build the extraction engine with an HTTP client, honoring the
+            // configured global user-agent if one was set.
+            let fetcher = match &self.user_agent {
+                Some(ua) => HttpClient::with_user_agent(ua),
+                None => HttpClient::new(),
+            };
+            let engine = ExtractionEngine::new(fetcher);
+            engine.run_with_retries(job).await
+        };
 
         // Write result to file.
         if let Err(e) = ResultWriter::write_with_config(&result, job, global_output_dir) {
@@ -172,7 +207,8 @@ impl Scheduler {
     /// Start the scheduler — runs all jobs according to their cron schedules.
     /// If a job has no schedule, it runs once immediately.
     pub async fn run(&self) -> Result<(), SchedulerError> {
-        let job_runner = JobRunner::new(self.log_tx.clone());
+        let job_runner =
+            JobRunner::with_user_agent(self.log_tx.clone(), self.config.user_agent.clone());
         let global_output_dir = self.config.output_dir.as_deref();
 
         let mut handles = Vec::new();
@@ -196,10 +232,10 @@ impl Scheduler {
             handles.push(handle);
         }
 
-        // Wait for all jobs (this will block indefinitely for cron jobs,
-        // which is the desired behavior for a daemon).
-        // In practice, the daemon runs forever.
-        if let Some(handle) = handles.into_iter().next() {
+        // Wait for all jobs. Cron jobs loop forever (so this blocks indefinitely,
+        // the desired behavior for a daemon); one-shot jobs all run to completion
+        // before the runtime is allowed to tear down.
+        for handle in handles {
             let _ = handle.await;
         }
 
@@ -281,10 +317,15 @@ fn parse_next_cron_run(expression: &str) -> Result<chrono::DateTime<Utc>, String
     }
 
     let now = Utc::now();
-    let mut next = now + chrono::Duration::seconds(1);
 
-    // Normalize to start of next minute.
-    next = next.with_second(0).unwrap().with_nanosecond(0).unwrap();
+    // Seed the search at the start of the *next* minute, so the returned time is
+    // always strictly in the future. (Truncating the current minute would land in
+    // the past for every-minute schedules, causing a 1s busy-loop in the caller.)
+    let mut next = (now + chrono::Duration::minutes(1))
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
 
     let minute_expr = parse_cron_field(&parts[0], 0, 59)?;
     let hour_expr = parse_cron_field(&parts[1], 0, 23)?;
@@ -294,12 +335,22 @@ fn parse_next_cron_run(expression: &str) -> Result<chrono::DateTime<Utc>, String
 
     // Find next matching time (simple forward search, up to 366 days).
     for _ in 0..525960 {
-        // Max ~1 year of minutes
-        if month_expr.contains(next.month() as u32)
-            && dow_expr.contains(next.weekday().num_days_from_sunday())
-            && dom_expr.contains(next.day() as u32)
-            && hour_expr.contains(next.hour() as u32)
-            && minute_expr.contains(next.minute() as u32)
+        // Max ~1 year of minutes.
+        // Standard cron day matching: when BOTH day-of-month and day-of-week are
+        // restricted, a day matches if EITHER field matches (OR). If either is `*`,
+        // fall back to plain AND across the restricted one.
+        let dom_match = dom_expr.contains(next.day());
+        let dow_match = dow_expr.contains(next.weekday().num_days_from_sunday());
+        let day_match = if !dom_expr.is_all() && !dow_expr.is_all() {
+            dom_match || dow_match
+        } else {
+            dom_match && dow_match
+        };
+
+        if month_expr.contains(next.month())
+            && day_match
+            && hour_expr.contains(next.hour())
+            && minute_expr.contains(next.minute())
         {
             return Ok(next);
         }
@@ -325,9 +376,7 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Result<CronField, String
     // Handle comma-separated values or ranges.
     let mut values = std::collections::HashSet::new();
     for part in field.split(',') {
-        if let Some(range) = part.strip_prefix("RANGE:") {
-            // Not supporting complex ranges for now.
-        } else if let Some((a, b)) = part.split_once('-') {
+        if let Some((a, b)) = part.split_once('-') {
             let start = a.parse::<u32>().map_err(|_| format!("invalid range start in '{part}'"))?;
             let end = b.parse::<u32>().map_err(|_| format!("invalid range end in '{part}'"))?;
             if start < min || end > max {
@@ -359,6 +408,11 @@ enum CronField {
 }
 
 impl CronField {
+    /// Whether this field is the unrestricted `*` wildcard.
+    fn is_all(&self) -> bool {
+        matches!(self, CronField::All)
+    }
+
     fn contains(&self, value: u32) -> bool {
         match self {
             CronField::All => true,
@@ -425,7 +479,7 @@ pub async fn run_all(config_path: &str) -> Result<(), SchedulerError> {
     let config = ConfigLoader::load(config_path)?;
     ConfigLoader::validate(&config)?;
 
-    let job_runner = JobRunner::new(log_tx);
+    let job_runner = JobRunner::with_user_agent(log_tx, config.user_agent.clone());
     let global_output_dir = config.output_dir.as_deref();
 
     println!("🌿 scrape-garden — running all jobs...");
@@ -501,5 +555,166 @@ mod tests {
     fn test_cron_parse_step() {
         let next = parse_next_cron_run("*/15 * * * *");
         assert!(next.is_ok());
+    }
+
+    // ── B1 regression: next run is always strictly in the future ────────────
+    #[test]
+    fn cron_next_run_is_strictly_future() {
+        let before = Utc::now();
+        let next = parse_next_cron_run("* * * * *").unwrap();
+        assert!(
+            next > before,
+            "next run {next} must be after now {before} (no busy-loop)"
+        );
+    }
+
+    // ── B1: */15 yields a minute in {0,15,30,45} ────────────────────────────
+    #[test]
+    fn cron_step_minute_is_aligned() {
+        let next = parse_next_cron_run("*/15 * * * *").unwrap();
+        assert!(
+            matches!(next.minute(), 0 | 15 | 30 | 45),
+            "minute {} not aligned to */15",
+            next.minute()
+        );
+    }
+
+    // ── B2 regression: DOM and DOW both restricted ⇒ OR semantics ──────────
+    #[test]
+    fn cron_dom_dow_or_semantics() {
+        // "0 0 13 * 5": midnight on the 13th OR any Friday. The next match must
+        // be within ~8 days (the longest gap to the next Friday), which it never
+        // would be under the old AND logic (13th-falling-on-Friday is rare).
+        let next = parse_next_cron_run("0 0 13 * 5").unwrap();
+        let days = (next - Utc::now()).num_days();
+        assert!(
+            days <= 8,
+            "next match {next} is {days} days out; OR semantics should keep it within a week"
+        );
+        // And the matched day must satisfy at least one of the two fields.
+        let is_13th = next.day() == 13;
+        let is_friday = next.weekday().num_days_from_sunday() == 5;
+        assert!(is_13th || is_friday, "matched day satisfies neither DOM nor DOW");
+    }
+
+    // ── B5: write creates parent dirs and appends valid JSONL ───────────────
+    #[test]
+    fn result_writer_creates_dirs_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/sub/out.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        let r1 = ScrapeResult::success("j", "https://x", serde_json::json!({"a": 1}));
+        let r2 = ScrapeResult::failure("j", "https://x", "boom");
+        ResultWriter::write(&r1, path_str).unwrap();
+        ResultWriter::write(&r2, path_str).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected one JSON object per line");
+        for line in lines {
+            serde_json::from_str::<ScrapeResult>(line).expect("each line is valid JSON");
+        }
+    }
+
+    // ── B5: output_dir treated as a directory ⇒ {dir}/{job_name}.jsonl ──────
+    #[test]
+    fn write_with_config_uses_dir_and_job_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+        let job = ScrapeJob {
+            job_name: "hn".into(),
+            url: "https://x".into(),
+            schedule: None,
+            fetcher: FetcherType::Http,
+            headers: Default::default(),
+            extraction: Vec::new(),
+            output: None,
+            retries: 0,
+        };
+        let result = ScrapeResult::success("hn", "https://x", serde_json::json!({}));
+        ResultWriter::write_with_config(&result, &job, Some(dir_str)).unwrap();
+
+        let expected = dir.path().join("hn.jsonl");
+        assert!(expected.exists(), "expected {expected:?} to be created");
+    }
+
+    // ── B5: explicit job.output overrides the dir ──────────────────────────
+    #[test]
+    fn write_with_config_explicit_output_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("explicit.jsonl");
+        let job = ScrapeJob {
+            job_name: "hn".into(),
+            url: "https://x".into(),
+            schedule: None,
+            fetcher: FetcherType::Http,
+            headers: Default::default(),
+            extraction: Vec::new(),
+            output: Some(file.to_str().unwrap().to_string()),
+            retries: 0,
+        };
+        let result = ScrapeResult::success("hn", "https://x", serde_json::json!({}));
+        ResultWriter::write_with_config(&result, &job, Some("ignored_dir")).unwrap();
+        assert!(file.exists());
+        assert!(!dir.path().join("hn.jsonl").exists());
+    }
+
+    // ── B4: Browser fetcher fails explicitly, doesn't silently use HTTP ─────
+    #[tokio::test]
+    async fn browser_fetcher_returns_explicit_error() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DashboardMessage>();
+        let runner = JobRunner::new(tx);
+        let dir = tempfile::tempdir().unwrap();
+        let job = ScrapeJob {
+            job_name: "b".into(),
+            url: "https://example.com".into(),
+            schedule: None,
+            fetcher: FetcherType::Browser,
+            headers: Default::default(),
+            extraction: Vec::new(),
+            output: Some(dir.path().join("b.jsonl").to_str().unwrap().to_string()),
+            retries: 0,
+        };
+        let result = runner.run_job(&job, None).await;
+        assert_eq!(result.status, JobStatus::Error);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("browser fetcher not implemented")
+        );
+    }
+
+    // ── ConfigLoader: load from YAML + validate ─────────────────────────────
+    #[test]
+    fn config_loader_loads_and_validates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &cfg_path,
+            "jobs:\n  - job_name: ok\n    url: https://example.com\n",
+        )
+        .unwrap();
+        let config = ConfigLoader::load(cfg_path.to_str().unwrap()).unwrap();
+        assert_eq!(config.jobs.len(), 1);
+        assert!(ConfigLoader::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn config_loader_validate_rejects_bad_scheme() {
+        let config = Config {
+            output_dir: None,
+            user_agent: None,
+            jobs: vec![ScrapeJob {
+                job_name: "bad".into(),
+                url: "ftp://example.com".into(),
+                schedule: None,
+                fetcher: FetcherType::Http,
+                headers: Default::default(),
+                extraction: Vec::new(),
+                output: None,
+                retries: 0,
+            }],
+        };
+        assert!(ConfigLoader::validate(&config).is_err());
     }
 }

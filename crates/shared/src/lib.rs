@@ -264,3 +264,79 @@ pub enum DashboardMessage {
     /// A new scrape result.
     Result(ScrapeResult),
 }
+
+// ─── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(url: &str) -> ScrapeJob {
+        ScrapeJob {
+            job_name: "j".into(),
+            url: url.into(),
+            schedule: None,
+            fetcher: FetcherType::Http,
+            headers: Default::default(),
+            extraction: Vec::new(),
+            output: None,
+            retries: default_retries(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_http_and_https() {
+        assert!(job("http://example.com").validate().is_ok());
+        assert!(job("https://example.com/path?q=1").validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_other_schemes_and_garbage() {
+        assert!(job("ftp://example.com").validate().is_err());
+        assert!(job("file:///etc/passwd").validate().is_err());
+        assert!(job("not a url").validate().is_err());
+    }
+
+    #[test]
+    fn config_round_trips_through_yaml() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("scrape_garden_cfg_{}.yaml", std::process::id()));
+        let path_str = path.to_str().unwrap();
+
+        let config = Config {
+            output_dir: Some("data".into()),
+            user_agent: Some("ua/1.0".into()),
+            jobs: vec![job("https://example.com")],
+        };
+        config.to_file(path_str).unwrap();
+        let loaded = Config::from_file(path_str).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.output_dir.as_deref(), Some("data"));
+        assert_eq!(loaded.user_agent.as_deref(), Some("ua/1.0"));
+        assert_eq!(loaded.jobs.len(), 1);
+        assert_eq!(loaded.jobs[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn default_retries_applied_on_deserialize() {
+        // `retries` omitted → serde default of 3.
+        let job: ScrapeJob =
+            serde_yaml::from_str("job_name: j\nurl: https://example.com\n").unwrap();
+        assert_eq!(job.retries, 3);
+        assert_eq!(job.fetcher, FetcherType::Http);
+    }
+
+    #[test]
+    fn result_success_and_failure_shapes() {
+        let ok = ScrapeResult::success("j", "https://x", serde_json::json!({"k": "v"}));
+        assert_eq!(ok.status, JobStatus::Done);
+        assert!(ok.error.is_none());
+        assert_eq!(ok.data["k"], serde_json::json!("v"));
+
+        let err = ScrapeResult::failure("j", "https://x", "nope");
+        assert_eq!(err.status, JobStatus::Error);
+        assert_eq!(err.error.as_deref(), Some("nope"));
+        assert!(err.data.is_null());
+    }
+}
