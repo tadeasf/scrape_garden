@@ -1,0 +1,17 @@
+[package]
+name = "scraper-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+shared = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+scraper.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+url.workspace = true

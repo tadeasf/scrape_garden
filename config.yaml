@@ -1,0 +1,29 @@
+# scrape-garden configuration file 🌿
+#
+# Global settings
+output_dir: "data/"
+user_agent: "scrape-garden/0.1.0"
+
+# List of scraping jobs
+jobs:
+  # Example: Scrape Hacker News titles
+  - job_name: "hacker_news"
+    url: "https://news.ycombinator.com/"
+    schedule: "0 */6 * * *"  # every 6 hours
+    fetcher: http
+    extraction:
+      - selector: ".titleline > a"
+        name: "title"
+      - selector: ".age a"
+        name: "time"
+    output: "data/hacker_news.jsonl"
+    retries: 3
+
+  # Example: Scrape a simple page
+  - job_name: "example_page"
+    url: "https://httpbin.org/html"
+    schedule: "0 */12 * * *"  # every 12 hours
+    fetcher: http
+    extraction: []
+    output: "data/example_page.jsonl"
+    retries: 2

@@ -1,0 +1,49 @@
+[package]
+name = "scrape-garden"
+version = "0.1.0"
+edition = "2021"
+authors = ["scrape-garden contributors"]
+license = "MIT"
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared",
+    "crates/scraper-core",
+    "crates/scheduler",
+    "crates/tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["scrape-garden contributors"]
+license = "MIT"
+
+[workspace.dependencies]
+shared = { path = "crates/shared" }
+scraper-core = { path = "crates/scraper-core" }
+scheduler = { path = "crates/scheduler" }
+tui = { path = "crates/tui" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+scraper = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+
+[dependencies]
+shared = { workspace = true }
+scraper-core = { workspace = true }
+scheduler = { workspace = true }
+tui = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+chrono = { workspace = true }
+tokio = { workspace = true }

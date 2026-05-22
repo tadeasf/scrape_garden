@@ -1,0 +1,28 @@
+# Example: Scrape Hacker News top stories
+#
+# Usage:
+#   scrape-garden --config examples/hacker_news.yaml run
+#
+# Or run in daemon mode:
+#   scrape-garden --config examples/hacker_news.yaml daemon
+
+output_dir: "data/"
+user_agent: "scrape-garden/0.1.0"
+
+jobs:
+  - job_name: "hacker_news_top"
+    url: "https://news.ycombinator.com/"
+    schedule: "0 */4 * * *"  # every 4 hours
+    fetcher: http
+    extraction:
+      - selector: ".titleline > a"
+        name: "title"
+        attribute: null
+      - selector: ".age a"
+        name: "time_ago"
+        attribute: null
+      - selector: ".titleline > a"
+        name: "url"
+        attribute: "href"
+    output: "data/hacker_news_top.jsonl"
+    retries: 3

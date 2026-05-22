@@ -1,0 +1,14 @@
+[package]
+name = "tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+shared = { workspace = true }
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+serde_json.workspace = true

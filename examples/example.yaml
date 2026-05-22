@@ -1,0 +1,28 @@
+# Example: Simple page scraping with multiple extraction rules
+#
+# This example scrapes httpbin.org which returns a known HTML structure.
+# Useful for testing extraction rules.
+
+output_dir: "data/"
+user_agent: "scrape-garden/0.1.0"
+
+jobs:
+  - job_name: "httpbin_html"
+    url: "https://httpbin.org/html"
+    schedule: "0 */12 * * *"  # every 12 hours
+    fetcher: http
+    extraction:
+      - selector: "h1"
+        name: "heading"
+      - selector: "p"
+        name: "paragraph"
+    output: "data/httpbin_html.jsonl"
+    retries: 2
+
+  - job_name: "httpbin_get"
+    url: "https://httpbin.org/get"
+    schedule: "0 * * * *"  # every hour
+    fetcher: http
+    extraction: []  # No extraction, just log the response
+    output: "data/httpbin_get.jsonl"
+    retries: 2
